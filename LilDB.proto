@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package lildb;
+
+service LilDBShell {
+  rpc RunCommand (stream CommandRequest) returns (stream CommandResponse) {}
+}
+
+message CommandRequest {
+  string command = 1;
+}
+
+message CommandResponse {
+  string output = 1;
+}

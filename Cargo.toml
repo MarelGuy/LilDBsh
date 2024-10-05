@@ -1,0 +1,36 @@
+cargo-features = ["profile-rustflags"]
+
+[package]
+name = "LilDBsh"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+crossterm = "0.28.1"
+tonic = "0.12.3"
+tokio = { version = "1.40.0", features = ["full"] }
+tokio-stream = "0.1.16"
+prost = "0.13.3"
+
+[build-dependencies]
+tonic-build = "0.12.3"
+
+[profile.dev]
+opt-level = 0
+debug = 2
+overflow-checks = true
+codegen-units = 1
+lto = "off"
+
+[profile.release]
+opt-level = 3
+lto = true
+debug = false
+rpath = false
+codegen-units = 1
+
+[profile.release.build-override]
+opt-level = 3
+debug = false
+codegen-units = 1
