@@ -26,10 +26,10 @@ fn read_input(input: &mut String) -> Result<(), Box<dyn Error>> {
             state: _,
         }) = read()?
         {
-            if kind == KeyEventKind::Release {
+            if kind == KeyEventKind::Release || kind == KeyEventKind::Press {
                 match (code, modifiers) {
                     (KeyCode::Enter, KeyModifiers::ALT) => {
-                        println!();
+                        print!("\n\r");
                         input.push('\n');
                         stdout().flush()?;
                     }
@@ -64,12 +64,14 @@ fn read_input(input: &mut String) -> Result<(), Box<dyn Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
 
-    println!("Please insert your LilDB address (no http://): ");
+    print!("Please insert your LilDB address (no http://):\n\r");
+
+    stdout().flush()?;
 
     let mut input = String::new();
     read_input(&mut input)?;
 
-    println!();
+    print!("\n\r");
 
     let mut client: LilDbShellClient<Channel> =
         LilDbShellClient::connect(format!("http://{}", input)).await?;
@@ -95,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut inbound: Streaming<CommandResponse> = response.into_inner();
 
         while let Some(res) = inbound.message().await? {
-            println!("\n{}", res.output);
+            print!("\n\r{}\n\r", res.output);
 
             if res.output.is_empty() {
                 process::exit(0);
