@@ -4,6 +4,8 @@ package lildb;
 
 service LilDBShell {
   rpc RunCommand (stream CommandRequest) returns (stream CommandResponse) {}
+  rpc ConnectToDB (ConnectRequest) returns (ConnectResponse) {}
+  rpc DisconnectFromDB (DisconnectRequest) returns (DisconnectResponse) {}
 }
 
 message CommandRequest {
@@ -12,4 +14,22 @@ message CommandRequest {
 
 message CommandResponse {
   string output = 1;
+}
+
+message ConnectRequest {
+  string ip = 1; 
+}
+
+message ConnectResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DisconnectRequest {
+  string ip = 1; 
+}
+
+message DisconnectResponse {
+  bool success = 1;
+  string message = 2;
 }
