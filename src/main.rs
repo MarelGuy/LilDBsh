@@ -6,6 +6,7 @@ use lildb::{
 };
 use lildb::{CommandRequest, CommandResponse};
 use std::{
+    env::args,
     error::Error,
     io::{stdout, Write},
     process,
@@ -17,9 +18,18 @@ pub mod lildb {
     tonic::include_proto!("lildb");
 }
 
-fn read_input(input: &mut String) -> Result<bool, Box<dyn Error>> {
+fn clear_input() -> Result<(), Box<dyn Error>> {
+    print!("\x1B[2K\x1B[1G");
     print!(">> ");
     stdout().flush()?;
+
+    Ok(())
+}
+
+fn read_input(input: &mut String, command_history: Vec<String>) -> Result<bool, Box<dyn Error>> {
+    clear_input()?;
+
+    let mut ch_len: usize = command_history.len();
 
     loop {
         if let Event::Key(KeyEvent {
@@ -34,48 +44,110 @@ fn read_input(input: &mut String) -> Result<bool, Box<dyn Error>> {
                     (KeyCode::Enter, KeyModifiers::ALT) => {
                         print!("\n\r");
                         input.push('\n');
-                        stdout().flush()?;
                     }
                     (KeyCode::Enter, _) => {
                         if !input.is_empty() {
-                            stdout().flush()?;
                             break;
                         }
                     }
                     (KeyCode::Backspace, _) if !input.is_empty() => {
                         input.pop();
                         print!("\x1B[1D\x1B[K");
-                        stdout().flush()?;
                     }
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(true),
                     (KeyCode::Char(c), _) => {
                         input.push(c);
                         print!("{}", c);
-                        stdout().flush()?;
+                    }
+                    (KeyCode::Up, _) => {
+                        if ch_len > 0 {
+                            ch_len -= 1;
+
+                            clear_input()?;
+
+                            *input = command_history[ch_len].clone();
+
+                            print!("{}", input);
+                        }
+                    }
+                    (KeyCode::Down, _) => {
+                        if ch_len < command_history.len() {
+                            ch_len += 1;
+
+                            if ch_len < command_history.len() {
+                                clear_input()?;
+
+                                *input = command_history[ch_len].clone();
+
+                                print!("{}", input);
+                            } else {
+                                *input = String::from("");
+                                clear_input()?;
+                            }
+                        }
                     }
                     _ => {} // _ => println!("{:?} {:?}", code, modifiers),
                 }
             }
         }
+        stdout().flush()?;
     }
 
     Ok(false)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    enable_raw_mode()?;
+fn check_args() -> String {
+    let cmd_args: Vec<String> = args().collect::<Vec<String>>();
 
-    print!("Please insert your LilDB address (no http://):\n\r");
+    let mut address: String = String::from("null");
 
-    stdout().flush()?;
+    for (i, arg) in cmd_args.clone().into_iter().enumerate() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                println!("Usage: lildbsh [--help | -h]");
+                println!("               [--version | -v]");
+                println!("               [--address | -a] <address>");
 
-    let mut input = String::new();
-    read_input(&mut input)?;
+                process::exit(0);
+            }
+            "--version" | "-v" => {
+                println!("LilDBsh 0.1.0");
 
-    print!("\n\r");
+                process::exit(0);
+            }
+            "--address" | "-a" => {
+                if cmd_args.len() > i + 1 {
+                    address = cmd_args[i + 1].clone();
+                } else {
+                    println!("No address provided, continuing as if nothing happened...");
+                }
+            }
+            _ => {}
+        }
+    }
 
-    let channel: Channel = Channel::from_shared(format!("http://{}", input))
+    address
+}
+
+async fn connect_to_db(
+    address: &String,
+    public_ip: &String,
+) -> Result<LilDbShellClient<Channel>, Box<dyn Error>> {
+    let mut input: String = String::new();
+
+    if address != "null" {
+        input = address.clone();
+    } else {
+        print!("Please insert your LilDB address:\n\r");
+
+        stdout().flush()?;
+
+        read_input(&mut input, Vec::new())?;
+
+        print!("\n\r");
+    }
+
+    let channel: Channel = Channel::from_shared(input)
         .unwrap()
         .keep_alive_while_idle(true)
         .keep_alive_timeout(Duration::from_secs(30))
@@ -83,8 +155,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let mut client: LilDbShellClient<Channel> = LilDbShellClient::new(channel);
-
-    let public_ip: String = reqwest::get("https://api.ipify.org").await?.text().await?;
 
     let response: lildb::ConnectResponse = client
         .connect_to_db(ConnectRequest {
@@ -101,14 +171,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(1);
     }
 
+    Ok(client)
+}
+
+async fn handle_shell(
+    mut client: LilDbShellClient<Channel>,
+    mut command_history: Vec<String>,
+    public_ip: String,
+) -> Result<(), Box<dyn Error>> {
     loop {
         let (tx, rx): (Sender<CommandRequest>, Receiver<CommandRequest>) = mpsc::channel(4);
+        let (tx_command, mut rx_command): (Sender<String>, Receiver<String>) = mpsc::channel(4);
         let (tx_disconnect, mut rx_disconnect): (Sender<bool>, Receiver<bool>) = mpsc::channel(4);
+
+        let command_history_clone = command_history.clone();
 
         tokio::spawn(async move {
             let mut command = String::new();
 
-            let mut exit: bool = read_input(&mut command).unwrap();
+            let mut exit: bool = read_input(&mut command, command_history_clone).unwrap();
 
             if command == "exit" {
                 exit = true;
@@ -119,6 +200,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await
             .unwrap();
+
+            tx_command.send(command).await.unwrap();
 
             tx_disconnect.send(exit).await.unwrap();
         });
@@ -138,19 +221,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        let command: String = rx_command.recv().await.unwrap();
+        command_history.push(command);
+
         let response: Response<Streaming<CommandResponse>> =
             client.run_command(ReceiverStream::new(rx)).await?;
 
         let mut inbound: Streaming<CommandResponse> = response.into_inner();
 
         while let Some(res) = inbound.message().await? {
-            print!("\n\r{}\n\r", res.output);
+            print!("\n\r{}", res.output);
 
             if res.output.is_empty() {
                 process::exit(0);
             }
         }
     }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    enable_raw_mode()?;
+
+    let address: String = check_args();
+    let public_ip: String = reqwest::get("https://api.ipify.org").await?.text().await?;
+
+    let client: LilDbShellClient<Channel> = connect_to_db(&address, &public_ip).await?;
+
+    let command_history: Vec<String> = Vec::new();
+
+    handle_shell(client, command_history, public_ip).await?;
 
     Ok(())
 }
