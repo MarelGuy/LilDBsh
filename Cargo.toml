@@ -9,10 +9,10 @@ build = "build.rs"
 [dependencies]
 crossterm = "0.28.1"
 tonic = "0.12.3"
-tokio = { version = "1.40.0", features = ["full"] }
-tokio-stream = "0.1.16"
-prost = "0.13.3"
-reqwest = "0.12.8"
+tokio = { version = "1.42.0", features = ["full"] }
+tokio-stream = "0.1.17"
+prost = "0.13.4"
+reqwest = "0.12.9"
 
 [build-dependencies]
 tonic-build = "0.12.3"
