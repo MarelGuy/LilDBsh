@@ -13,6 +13,8 @@ tokio = { version = "1.44.2", features = ["full"] }
 tokio-stream = "0.1.17"
 prost = "0.13.5"
 reqwest = "0.12.15"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
 
 [build-dependencies]
 tonic-build = "0.13.0"
