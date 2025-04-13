@@ -221,10 +221,10 @@ async fn handle_shell(
         let (tx_command, mut rx_command): (Sender<String>, Receiver<String>) = mpsc::channel(4);
         let (tx_disconnect, mut rx_disconnect): (Sender<bool>, Receiver<bool>) = mpsc::channel(4);
 
-        let command_history_clone = command_history.clone();
+        let command_history_clone: Vec<String> = command_history.clone();
 
         tokio::spawn(async move {
-            let mut command = String::new();
+            let mut command: String = String::new();
 
             let mut exit: bool = read_input(&mut command, command_history_clone).unwrap();
 
@@ -268,10 +268,6 @@ async fn handle_shell(
 
         while let Some(res) = inbound.message().await? {
             print!("\n\r{}", res.output);
-
-            if res.output.is_empty() {
-                process::exit(0);
-            }
         }
     }
 
