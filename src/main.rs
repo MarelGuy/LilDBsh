@@ -14,6 +14,7 @@ use std::{
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Channel, Response, Streaming};
+use tracing::{error, info};
 pub mod lildb {
     tonic::include_proto!("lildb");
 }
@@ -21,6 +22,7 @@ pub mod lildb {
 fn clear_input() -> Result<(), Box<dyn Error>> {
     print!("\x1B[2K\x1B[1G");
     print!(">> ");
+
     stdout().flush()?;
 
     Ok(())
@@ -119,7 +121,7 @@ fn check_args() -> String {
                 if cmd_args.len() > i + 1 {
                     address = cmd_args[i + 1].clone();
                 } else {
-                    println!("No address provided, continuing as if nothing happened...");
+                    error!("No address provided, continuing as if nothing happened...");
                 }
             }
             _ => {}
@@ -147,12 +149,47 @@ async fn connect_to_db(
         print!("\n\r");
     }
 
-    let channel: Channel = Channel::from_shared(input)
-        .unwrap()
-        .keep_alive_while_idle(true)
-        .keep_alive_timeout(Duration::from_secs(30))
-        .connect()
-        .await?;
+    let max_retries: i32 = 3;
+    let mut attempts: i32 = 0;
+
+    let channel: Channel;
+
+    loop {
+        attempts += 1;
+
+        info!(
+            "Attempting to connect to {} (Attempt {}/{})",
+            input, attempts, max_retries
+        );
+
+        let channel_result: Result<Channel, tonic::transport::Error> =
+            Channel::from_shared(input.clone())
+                .unwrap()
+                .keep_alive_while_idle(true)
+                .keep_alive_timeout(Duration::from_secs(30))
+                .connect()
+                .await;
+
+        match channel_result {
+            Ok(ch) => {
+                info!("Successfully connected to {}.", input);
+                channel = ch;
+                break;
+            }
+            Err(e) => {
+                error!("Connection attempt {} failed: {}", attempts, e);
+                if attempts >= max_retries {
+                    error!(
+                        "Failed to connect to {} after {} attempts.",
+                        input, max_retries
+                    );
+
+                    process::exit(0);
+                }
+                info!("Retrying...",);
+            }
+        }
+    }
 
     let mut client: LilDbShellClient<Channel> = LilDbShellClient::new(channel);
 
@@ -164,9 +201,9 @@ async fn connect_to_db(
         .into_inner();
 
     if response.success {
-        print!("{}!\n\r", response.message);
+        print!("{}\n\r", response.message);
     } else {
-        print!("Failed to connect to\n\r");
+        error!("Failed to connect to\n\r");
 
         process::exit(1);
     }
@@ -215,7 +252,7 @@ async fn handle_shell(
                 .into_inner();
 
             if disconnection.success {
-                print!("\n\r{}!\n\r", disconnection.message);
+                info!("\n\r{}", disconnection.message);
 
                 break;
             }
@@ -243,6 +280,7 @@ async fn handle_shell(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt::init();
     enable_raw_mode()?;
 
     let address: String = check_args();
