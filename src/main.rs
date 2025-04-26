@@ -28,7 +28,7 @@ fn clear_input() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn read_input(input: &mut String, command_history: Vec<String>) -> Result<bool, Box<dyn Error>> {
+fn read_input(input: &mut String, command_history: &[String]) -> Result<bool, Box<dyn Error>> {
     clear_input()?;
 
     let mut ch_len: usize = command_history.len();
@@ -59,7 +59,7 @@ fn read_input(input: &mut String, command_history: Vec<String>) -> Result<bool, 
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(true),
                     (KeyCode::Char(c), _) => {
                         input.push(c);
-                        print!("{}", c);
+                        print!("{c}");
                     }
                     (KeyCode::Up, _) => {
                         if ch_len > 0 {
@@ -67,9 +67,9 @@ fn read_input(input: &mut String, command_history: Vec<String>) -> Result<bool, 
 
                             clear_input()?;
 
-                            *input = command_history[ch_len].clone();
+                            input.clone_from(&command_history[ch_len]);
 
-                            print!("{}", input);
+                            print!("{input}");
                         }
                     }
                     (KeyCode::Down, _) => {
@@ -79,11 +79,11 @@ fn read_input(input: &mut String, command_history: Vec<String>) -> Result<bool, 
                             if ch_len < command_history.len() {
                                 clear_input()?;
 
-                                *input = command_history[ch_len].clone();
+                                input.clone_from(&command_history[ch_len]);
 
-                                print!("{}", input);
+                                print!("{input}");
                             } else {
-                                *input = String::from("");
+                                *input = String::new();
                                 clear_input()?;
                             }
                         }
@@ -119,7 +119,7 @@ fn check_args() -> String {
             }
             "--address" | "-a" => {
                 if cmd_args.len() > i + 1 {
-                    address = cmd_args[i + 1].clone();
+                    address.clone_from(&cmd_args[i + 1]);
                 } else {
                     error!("No address provided, continuing as if nothing happened...");
                 }
@@ -137,16 +137,16 @@ async fn connect_to_db(
 ) -> Result<LilDbShellClient<Channel>, Box<dyn Error>> {
     let mut input: String = String::new();
 
-    if address != "null" {
-        input = address.clone();
-    } else {
+    if address == "null" {
         print!("Please insert your LilDB address:\n\r");
 
         stdout().flush()?;
 
-        read_input(&mut input, Vec::new())?;
+        read_input(&mut input, &Vec::new())?;
 
         print!("\n\r");
+    } else {
+        input.clone_from(address);
     }
 
     let max_retries: i32 = 3;
@@ -226,14 +226,14 @@ async fn handle_shell(
         tokio::spawn(async move {
             let mut command: String = String::new();
 
-            let mut exit: bool = read_input(&mut command, command_history_clone).unwrap();
+            let mut exit: bool = read_input(&mut command, &command_history_clone).unwrap();
 
             if command == "exit" {
                 exit = true;
             }
 
             tx.send(CommandRequest {
-                command: command.to_owned(),
+                command: command.clone(),
             })
             .await
             .unwrap();
