@@ -1,107 +1,37 @@
-use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use directories::ProjectDirs;
 use lildb::{
-    lil_db_shell_client::LilDbShellClient, ConnectRequest, DisconnectRequest, DisconnectResponse,
+    lil_db_shell_client::LilDbShellClient, CommandRequest, ConnectRequest, DisconnectRequest,
 };
-use lildb::{CommandRequest, CommandResponse};
-use std::time::Duration;
+use reedline::{DefaultPrompt, DefaultPromptSegment, FileBackedHistory, Reedline, Signal};
 use std::{
     env::args,
     io::{stdout, Write},
     process,
+    time::Duration,
 };
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{transport::Channel, Streaming};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 use tracing::{error, info};
+
+#[cfg(feature = "tracy")]
+use std::alloc::System;
+
 pub mod lildb {
     tonic::include_proto!("lildb");
 }
 
-fn clear_input() -> anyhow::Result<()> {
-    print!("\x1B[2K\x1B[1G");
-    print!(">> ");
+#[cfg(feature = "tracy")]
+#[global_allocator]
+static GLOBAL: tracy_client::ProfiledAllocator<System> =
+    tracy_client::ProfiledAllocator::new(System, 100);
 
-    stdout().flush()?;
-
-    Ok(())
-}
-
-fn read_input(input: &mut String, command_history: &[String]) -> anyhow::Result<bool> {
-    clear_input()?;
-
-    let mut ch_len: usize = command_history.len();
-
-    loop {
-        if let Ok(Event::Key(KeyEvent {
-            code,
-            kind,
-            modifiers,
-            state: _,
-        })) = read()
-        {
-            if kind == KeyEventKind::Press {
-                match (code, modifiers) {
-                    (KeyCode::Enter, KeyModifiers::ALT) => {
-                        print!("\n\r");
-                        input.push('\n');
-                    }
-                    (KeyCode::Enter, _) => {
-                        if !input.is_empty() {
-                            break;
-                        }
-                    }
-                    (KeyCode::Backspace, _) if !input.is_empty() => {
-                        input.pop();
-                        print!("\x1B[1D\x1B[K");
-                    }
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(true),
-                    (KeyCode::Char(c), _) => {
-                        input.push(c);
-                        print!("{c}");
-                    }
-                    (KeyCode::Up, _) => {
-                        if ch_len > 0 {
-                            ch_len -= 1;
-
-                            clear_input()?;
-
-                            input.clone_from(&command_history[ch_len]);
-
-                            print!("{input}");
-                        }
-                    }
-                    (KeyCode::Down, _) => {
-                        if ch_len < command_history.len() {
-                            ch_len += 1;
-
-                            if ch_len < command_history.len() {
-                                clear_input()?;
-
-                                input.clone_from(&command_history[ch_len]);
-
-                                print!("{input}");
-                            } else {
-                                *input = String::new();
-                                clear_input()?;
-                            }
-                        }
-                    }
-                    _ => {} // _ => println!("{:?} {:?}", code, modifiers),
-                }
-            }
-        }
-
-        stdout().flush()?;
-    }
-
-    Ok(false)
-}
-
-fn check_args() -> String {
+fn check_args() -> (String, Option<String>, Option<String>) {
     let cmd_args: Vec<String> = args().collect::<Vec<String>>();
 
     let mut address: String = String::from("null");
+    let mut ca_cert_path: Option<String> = None;
+    let mut domain_override: Option<String> = None;
 
     for (i, arg) in cmd_args.clone().into_iter().enumerate() {
         match arg.as_str() {
@@ -109,6 +39,8 @@ fn check_args() -> String {
                 println!("Usage: lildbsh [--help | -h]");
                 println!("               [--version | -v]");
                 println!("               [--address | -a] <address>");
+                println!("               [--cert | -c] <ca_cert_path>");
+                println!("               [--domain | -d] <domain>");
 
                 process::exit(0);
             }
@@ -124,31 +56,42 @@ fn check_args() -> String {
                     error!("No address provided, continuing as if nothing happened...");
                 }
             }
+            "--cert" | "-c" => {
+                if i + 1 < cmd_args.len() {
+                    ca_cert_path = Some(cmd_args[i + 1].clone());
+                } else {
+                    error!("No certificate path provided...");
+                }
+            }
+            "--domain" | "-d" => {
+                if i + 1 < cmd_args.len() {
+                    domain_override = Some(cmd_args[i + 1].clone());
+                }
+            }
             _ => {}
         }
     }
 
-    address
+    (address, ca_cert_path, domain_override)
 }
 
 async fn connect_to_db(
     address: &String,
     public_ip: &String,
+    ca_cert_path: Option<String>,
+    domain_override: Option<String>,
 ) -> anyhow::Result<LilDbShellClient<Channel>> {
     let mut input: String = String::new();
 
     if address == "null" {
-        enable_raw_mode()?;
-
-        print!("Please insert your LilDB address:\n\r");
-
+        print!("Please insert your LilDB address: ");
         stdout().flush()?;
 
-        read_input(&mut input, &Vec::new())?;
+        let mut stdin_input = String::new();
 
-        print!("\n\r");
+        std::io::stdin().read_line(&mut stdin_input)?;
 
-        disable_raw_mode()?;
+        input = stdin_input.trim().to_string();
     } else {
         input.clone_from(address);
     }
@@ -166,21 +109,46 @@ async fn connect_to_db(
             input, attempts, max_retries
         );
 
-        let channel_result: Result<Channel, tonic::transport::Error> =
-            Channel::from_shared(input.clone())?
-                .keep_alive_while_idle(true)
-                .keep_alive_timeout(Duration::from_secs(30))
-                .connect()
-                .await;
+        let mut endpoint = Channel::from_shared(input.clone())?
+            .keep_alive_while_idle(true)
+            .keep_alive_timeout(Duration::from_secs(30));
+
+        let use_tls = input.starts_with("https") || ca_cert_path.is_some();
+
+        if use_tls {
+            let mut tls_config = ClientTlsConfig::new()
+                .with_enabled_roots()
+                .with_native_roots();
+
+            if let Some(ref path) = ca_cert_path {
+                let pem = tokio::fs::read_to_string(path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to read CA cert at {path}: {e}"))?;
+
+                let ca = Certificate::from_pem(pem);
+                tls_config = tls_config.ca_certificate(ca);
+            }
+
+            if let Some(ref domain) = domain_override {
+                tls_config = tls_config.domain_name(domain);
+            }
+
+            endpoint = endpoint.tls_config(tls_config)?;
+        }
+
+        let channel_result = endpoint.connect().await;
 
         match channel_result {
             Ok(ch) => {
                 info!("Successfully connected to {}.", input);
+
                 channel = ch;
+
                 break;
             }
             Err(e) => {
                 error!("Connection attempt {} failed: {}", attempts, e);
+
                 if attempts >= max_retries {
                     error!(
                         "Failed to connect to {} after {} attempts.",
@@ -189,7 +157,10 @@ async fn connect_to_db(
 
                     process::exit(0);
                 }
-                info!("Retrying...",);
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                info!("Retrying...");
             }
         }
     }
@@ -198,7 +169,7 @@ async fn connect_to_db(
 
     let response: lildb::ConnectResponse = client
         .connect_to_db(ConnectRequest {
-            ip: public_ip.to_string(),
+            ip: public_ip.clone(),
         })
         .await?
         .into_inner();
@@ -207,7 +178,6 @@ async fn connect_to_db(
         print!("{}\n\r", response.message);
     } else {
         error!("Failed to connect to\n\r");
-
         process::exit(1);
     }
 
@@ -216,89 +186,109 @@ async fn connect_to_db(
 
 async fn handle_shell(
     mut client: LilDbShellClient<Channel>,
-    mut command_history: Vec<String>,
     public_ip: String,
 ) -> anyhow::Result<()> {
-    loop {
-        let (tx, rx): (Sender<CommandRequest>, Receiver<CommandRequest>) = mpsc::channel(4);
-        let (tx_command, mut rx_command): (Sender<String>, Receiver<String>) = mpsc::channel(4);
-        let (tx_disconnect, mut rx_disconnect): (Sender<bool>, Receiver<bool>) = mpsc::channel(4);
+    let (tx, rx) = mpsc::channel(32);
 
-        let command_history_clone: Vec<String> = command_history.clone();
+    let mut client_clone = client.clone();
 
-        tokio::spawn(async move {
-            let mut command: String = String::new();
+    tokio::spawn(async move {
+        let stream = ReceiverStream::new(rx);
 
-            let mut exit: bool = read_input(&mut command, &command_history_clone)?;
+        match client_clone.run_command(stream).await {
+            Ok(response) => {
+                let mut inbound = response.into_inner();
 
-            if command == "exit" {
-                exit = true;
+                while let Some(res) = inbound.message().await.unwrap_or(None) {
+                    print!("\r\n{}", res.output);
+
+                    let _ = stdout().flush();
+                }
             }
+            Err(e) => error!("Server connection lost: {}", e),
+        }
+    });
 
-            tx.send(CommandRequest {
-                command: command.clone(),
-            })
-            .await?;
+    let history_path = if let Some(proj_dirs) = ProjectDirs::from("com", "lildb", "lildbsh") {
+        let data_dir = proj_dirs.data_dir();
 
-            tx_command.send(command).await?;
+        if let Err(e) = std::fs::create_dir_all(data_dir) {
+            error!("Could not create history directory: {}", e);
 
-            tx_disconnect.send(exit).await?;
+            None
+        } else {
+            Some(data_dir.join("history.txt"))
+        }
+    } else {
+        None
+    };
 
-            Ok::<(), anyhow::Error>(())
-        });
+    let history = match history_path {
+        Some(path) => FileBackedHistory::with_file(1000, path.into())?,
+        None => FileBackedHistory::with_file(1000, "lildb_history.txt".into())?,
+    };
 
-        if let Some(should_exit) = rx_disconnect.recv().await {
-            if should_exit {
-                let disconnection: DisconnectResponse = client
-                    .disconnect_from_db(DisconnectRequest {
-                        ip: public_ip.to_string(),
-                    })
-                    .await?
-                    .into_inner();
+    let mut line_editor = Reedline::create().with_history(Box::new(history));
 
-                if disconnection.success {
-                    info!("\n\r{}", disconnection.message);
+    let prompt = DefaultPrompt::new(DefaultPromptSegment::Empty, DefaultPromptSegment::Empty);
 
+    loop {
+        let sig = line_editor.read_line(&prompt);
+
+        match sig {
+            Ok(Signal::Success(buffer)) => {
+                let trimmed = buffer.trim();
+
+                if trimmed == "exit" {
                     break;
                 }
-            }
-        }
 
-        if let Some(command) = rx_command.recv().await {
-            command_history.push(command);
-        }
-
-        match client.run_command(ReceiverStream::new(rx)).await {
-            Ok(response) => {
-                let mut inbound: Streaming<CommandResponse> = response.into_inner();
-
-                while let Some(res) = inbound.message().await? {
-                    print!("\n\r{}", res.output);
+                if !trimmed.is_empty() {
+                    if let Err(e) = tx.send(CommandRequest { command: buffer }).await {
+                        error!("Failed to send command: {}", e);
+                        break;
+                    }
                 }
             }
-            Err(e) => error!("Command failed: {}", e),
+            Ok(Signal::CtrlC | Signal::CtrlD) => {
+                println!("\r\nAborted.");
+
+                break;
+            }
+            Err(err) => {
+                error!("Error reading line: {:?}", err);
+                break;
+            }
         }
     }
+
+    let _ = client
+        .disconnect_from_db(DisconnectRequest { ip: public_ip })
+        .await;
 
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     tracing_subscriber::fmt::init();
 
-    let address: String = check_args();
+    #[cfg(feature = "tracy")]
+    {
+        info!("Tracy is active");
+    }
+
+    let (address, ca_cert_path, domain_override) = check_args();
     let public_ip: String = reqwest::get("https://api.ipify.org").await?.text().await?;
 
-    let client: LilDbShellClient<Channel> = connect_to_db(&address, &public_ip).await?;
+    let client: LilDbShellClient<Channel> =
+        connect_to_db(&address, &public_ip, ca_cert_path, domain_override).await?;
 
-    let command_history: Vec<String> = Vec::new();
-
-    enable_raw_mode()?;
-
-    handle_shell(client, command_history, public_ip).await?;
-
-    disable_raw_mode()?;
+    handle_shell(client, public_ip).await?;
 
     Ok(())
 }
