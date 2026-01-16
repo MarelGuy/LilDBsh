@@ -2,34 +2,34 @@ syntax = "proto3";
 
 package lildb;
 
-service LilDBShell {
-  rpc RunCommand (stream CommandRequest) returns (stream CommandResponse) {}
-  rpc ConnectToDB (ConnectRequest) returns (ConnectResponse) {}
-  rpc DisconnectFromDB (DisconnectRequest) returns (DisconnectResponse) {}
+service LilDBShellService {
+  rpc RunCommand(stream RunCommandRequest) returns (stream RunCommandResponse) {}
+  rpc ConnectToDB(ConnectToDBRequest) returns (ConnectToDBResponse) {}
+  rpc DisconnectFromDB(DisconnectFromDBRequest) returns (DisconnectFromDBResponse) {}
 }
 
-message CommandRequest {
+message RunCommandRequest {
   string command = 1;
 }
 
-message CommandResponse {
+message RunCommandResponse {
   string output = 1;
 }
 
-message ConnectRequest {
-  string ip = 1; 
+message ConnectToDBRequest {
+  string session_id = 1;
 }
 
-message ConnectResponse {
+message ConnectToDBResponse {
   bool success = 1;
   string message = 2;
 }
 
-message DisconnectRequest {
-  string ip = 1; 
+message DisconnectFromDBRequest {
+  string session_id = 1;
 }
 
-message DisconnectResponse {
+message DisconnectFromDBResponse {
   bool success = 1;
   string message = 2;
 }

@@ -1,10 +1,7 @@
+use clap::Parser;
 use directories::ProjectDirs;
-use lildb::{
-    lil_db_shell_client::LilDbShellClient, CommandRequest, ConnectRequest, DisconnectRequest,
-};
 use reedline::{DefaultPrompt, DefaultPromptSegment, FileBackedHistory, Reedline, Signal};
 use std::{
-    env::args,
     io::{stdout, Write},
     process,
     time::Duration,
@@ -13,9 +10,15 @@ use tokio::sync::mpsc::{self};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 use tracing::{error, info};
+use uuid::Uuid;
 
 #[cfg(feature = "tracy")]
 use std::alloc::System;
+
+use crate::lildb::{
+    lil_db_shell_service_client::LilDbShellServiceClient, ConnectToDbRequest, ConnectToDbResponse,
+    DisconnectFromDbRequest, RunCommandRequest,
+};
 
 pub mod lildb {
     tonic::include_proto!("lildb");
@@ -26,61 +29,27 @@ pub mod lildb {
 static GLOBAL: tracy_client::ProfiledAllocator<System> =
     tracy_client::ProfiledAllocator::new(System, 100);
 
-fn check_args() -> (String, Option<String>, Option<String>) {
-    let cmd_args: Vec<String> = args().collect::<Vec<String>>();
+#[derive(Parser, Debug)]
+#[command(name = "lildbsh")]
+#[command(version = "0.1.0")]
+#[command(about = "Shell client for LilDB", long_about = None)]
+struct Cli {
+    #[arg(short, long)]
+    address: Option<String>,
 
-    let mut address: String = String::from("null");
-    let mut ca_cert_path: Option<String> = None;
-    let mut domain_override: Option<String> = None;
+    #[arg(short = 'c', long = "cert")]
+    ca_cert_path: Option<String>,
 
-    for (i, arg) in cmd_args.clone().into_iter().enumerate() {
-        match arg.as_str() {
-            "--help" | "-h" => {
-                println!("Usage: lildbsh [--help | -h]");
-                println!("               [--version | -v]");
-                println!("               [--address | -a] <address>");
-                println!("               [--cert | -c] <ca_cert_path>");
-                println!("               [--domain | -d] <domain>");
-
-                process::exit(0);
-            }
-            "--version" | "-v" => {
-                println!("LilDBsh 0.1.0");
-
-                process::exit(0);
-            }
-            "--address" | "-a" => {
-                if cmd_args.len() > i + 1 {
-                    address.clone_from(&cmd_args[i + 1]);
-                } else {
-                    error!("No address provided, continuing as if nothing happened...");
-                }
-            }
-            "--cert" | "-c" => {
-                if i + 1 < cmd_args.len() {
-                    ca_cert_path = Some(cmd_args[i + 1].clone());
-                } else {
-                    error!("No certificate path provided...");
-                }
-            }
-            "--domain" | "-d" => {
-                if i + 1 < cmd_args.len() {
-                    domain_override = Some(cmd_args[i + 1].clone());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    (address, ca_cert_path, domain_override)
+    #[arg(short = 'd', long = "domain")]
+    domain_override: Option<String>,
 }
 
 async fn connect_to_db(
     address: &String,
-    public_ip: &String,
+    session_id: &String,
     ca_cert_path: Option<String>,
     domain_override: Option<String>,
-) -> anyhow::Result<LilDbShellClient<Channel>> {
+) -> anyhow::Result<LilDbShellServiceClient<Channel>> {
     let mut input: String = String::new();
 
     if address == "null" {
@@ -165,11 +134,11 @@ async fn connect_to_db(
         }
     }
 
-    let mut client: LilDbShellClient<Channel> = LilDbShellClient::new(channel);
+    let mut client: LilDbShellServiceClient<Channel> = LilDbShellServiceClient::new(channel);
 
-    let response: lildb::ConnectResponse = client
-        .connect_to_db(ConnectRequest {
-            ip: public_ip.clone(),
+    let response: ConnectToDbResponse = client
+        .connect_to_db(ConnectToDbRequest {
+            session_id: session_id.clone(),
         })
         .await?
         .into_inner();
@@ -185,8 +154,8 @@ async fn connect_to_db(
 }
 
 async fn handle_shell(
-    mut client: LilDbShellClient<Channel>,
-    public_ip: String,
+    mut client: LilDbShellServiceClient<Channel>,
+    session_id: String,
 ) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel(32);
 
@@ -244,7 +213,7 @@ async fn handle_shell(
                 }
 
                 if !trimmed.is_empty() {
-                    if let Err(e) = tx.send(CommandRequest { command: buffer }).await {
+                    if let Err(e) = tx.send(RunCommandRequest { command: buffer }).await {
                         error!("Failed to send command: {}", e);
                         break;
                     }
@@ -263,7 +232,9 @@ async fn handle_shell(
     }
 
     let _ = client
-        .disconnect_from_db(DisconnectRequest { ip: public_ip })
+        .disconnect_from_db(DisconnectFromDbRequest {
+            session_id: session_id,
+        })
         .await;
 
     Ok(())
@@ -282,13 +253,15 @@ async fn main() -> anyhow::Result<()> {
         info!("Tracy is active");
     }
 
-    let (address, ca_cert_path, domain_override) = check_args();
-    let public_ip: String = reqwest::get("https://api.ipify.org").await?.text().await?;
+    let cli = Cli::parse();
+    let address = cli.address.unwrap_or_else(|| "null".to_string());
 
-    let client: LilDbShellClient<Channel> =
-        connect_to_db(&address, &public_ip, ca_cert_path, domain_override).await?;
+    let session_id = Uuid::new_v4().to_string();
 
-    handle_shell(client, public_ip).await?;
+    let client: LilDbShellServiceClient<Channel> =
+        connect_to_db(&address, &session_id, cli.ca_cert_path, cli.domain_override).await?;
+
+    handle_shell(client, session_id).await?;
 
     Ok(())
 }
