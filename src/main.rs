@@ -1,13 +1,15 @@
 use anyhow::bail;
 use clap::Parser;
 use directories::ProjectDirs;
-use reedline::{DefaultPrompt, DefaultPromptSegment, FileBackedHistory, Reedline, Signal};
-use std::{
-    io::{self, stdout, Write},
-    path::Path,
-    time::Duration,
+use reedline::{
+    DefaultPrompt, DefaultPromptSegment, ExternalPrinter, FileBackedHistory, Reedline, Signal,
+    HISTORY_SIZE,
 };
-use tokio::sync::mpsc::{self};
+use std::{path::Path, time::Duration};
+use tokio::{
+    io::{self, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader, Stdout},
+    sync::mpsc::{self},
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
     transport::{self, Certificate, Channel, ClientTlsConfig, Endpoint},
@@ -33,6 +35,9 @@ pub mod lildb {
 static GLOBAL: tracy_client::ProfiledAllocator<System> =
     tracy_client::ProfiledAllocator::new(System, 100);
 
+const KEEP_ALIVE: u64 = 30;
+const RETRIES: u8 = 3;
+
 #[derive(Parser, Debug)]
 #[command(name = "lildbsh")]
 #[command(version = "0.1.0")]
@@ -57,17 +62,23 @@ async fn connect_to_db(
     let input: String = if let Some(address) = address {
         address
     } else {
-        print!("Please insert your LilDB address: ");
-        stdout().flush()?;
+        let mut stdout: Stdout = stdout();
+
+        stdout
+            .write_all(b"Please insert your LilDB address: ")
+            .await?;
+
+        stdout.flush().await?;
 
         let mut stdin_input: String = String::new();
 
-        io::stdin().read_line(&mut stdin_input)?;
+        let mut reader: BufReader<tokio::io::Stdin> = BufReader::new(tokio::io::stdin());
+
+        reader.read_line(&mut stdin_input).await?;
 
         stdin_input.trim().to_string()
     };
 
-    let max_retries: u8 = 3;
     let mut attempts: u8 = 0;
 
     let channel: Channel;
@@ -77,12 +88,12 @@ async fn connect_to_db(
 
         info!(
             "Attempting to connect to {} (Attempt {}/{})",
-            input, attempts, max_retries
+            input, attempts, RETRIES
         );
 
         let mut endpoint: Endpoint = Channel::from_shared(input.clone())?
             .keep_alive_while_idle(true)
-            .keep_alive_timeout(Duration::from_secs(30));
+            .keep_alive_timeout(Duration::from_secs(KEEP_ALIVE));
 
         let use_tls: bool = input.starts_with("https") || ca_cert_path.is_some();
 
@@ -123,11 +134,8 @@ async fn connect_to_db(
             Err(e) => {
                 error!("Connection attempt {} failed: {}", attempts, e);
 
-                if attempts >= max_retries {
-                    error!(
-                        "Failed to connect to {} after {} attempts.",
-                        input, max_retries
-                    );
+                if attempts >= RETRIES {
+                    error!("Failed to connect to {} after {} attempts.", input, RETRIES);
 
                     bail!("Exiting...")
                 }
@@ -168,25 +176,6 @@ async fn handle_shell(
         mpsc::Receiver<RunCommandRequest>,
     ) = mpsc::channel(32);
 
-    let mut client_clone: LilDbShellServiceClient<Channel> = client.clone();
-
-    tokio::spawn(async move {
-        let stream: ReceiverStream<RunCommandRequest> = ReceiverStream::new(rx);
-
-        match client_clone.run_command(stream).await {
-            Ok(response) => {
-                let mut inbound: Streaming<RunCommandResponse> = response.into_inner();
-
-                while let Some(res) = inbound.message().await.unwrap_or(None) {
-                    print!("\r\n{}", res.output);
-
-                    let _ = stdout().flush();
-                }
-            }
-            Err(e) => error!("Server connection lost: {}", e),
-        }
-    });
-
     let history_path: Option<std::path::PathBuf> =
         if let Some(proj_dirs) = ProjectDirs::from("com", "lildb", "lildbsh") {
             let data_dir: &Path = proj_dirs.data_dir();
@@ -203,16 +192,39 @@ async fn handle_shell(
         };
 
     let history: FileBackedHistory = match history_path {
-        Some(path) => FileBackedHistory::with_file(1000, path.into())?,
-        None => FileBackedHistory::with_file(1000, "lildb_history.txt".into())?,
+        Some(path) => FileBackedHistory::with_file(HISTORY_SIZE, path)?,
+        None => FileBackedHistory::with_file(HISTORY_SIZE, "lildb_history.txt".into())?,
     };
 
-    let mut line_editor: Reedline = Reedline::create().with_history(Box::new(history));
+    let printer: ExternalPrinter<String> = ExternalPrinter::new(128);
+
+    let sender = printer.sender();
+
+    let mut line_editor: Reedline = Reedline::create()
+        .with_history(Box::new(history))
+        .with_external_printer(printer);
+
+    let mut client_clone: LilDbShellServiceClient<Channel> = client.clone();
+
+    tokio::spawn(async move {
+        let stream: ReceiverStream<RunCommandRequest> = ReceiverStream::new(rx);
+
+        match client_clone.run_command(stream).await {
+            Ok(response) => {
+                let mut inbound: Streaming<RunCommandResponse> = response.into_inner();
+
+                while let Some(res) = inbound.message().await.unwrap_or(None) {
+                    let _ = sender.send(res.output);
+                }
+            }
+            Err(e) => error!("Server connection lost: {}", e),
+        }
+    });
 
     let prompt: DefaultPrompt =
         DefaultPrompt::new(DefaultPromptSegment::Empty, DefaultPromptSegment::Empty);
 
-    loop {
+    tokio::task::spawn_blocking(move || loop {
         let sig: Result<Signal, io::Error> = line_editor.read_line(&prompt);
 
         match sig {
@@ -224,7 +236,7 @@ async fn handle_shell(
                 }
 
                 if !trimmed.is_empty() {
-                    if let Err(e) = tx.send(RunCommandRequest { command: buffer }).await {
+                    if let Err(e) = tx.blocking_send(RunCommandRequest { command: buffer }) {
                         error!("Failed to send command: {}", e);
 
                         break;
@@ -233,21 +245,18 @@ async fn handle_shell(
             }
             Ok(Signal::CtrlC | Signal::CtrlD) => {
                 println!("\r\nAborted.");
-
                 break;
             }
             Err(err) => {
                 error!("Error reading line: {:?}", err);
-
                 break;
             }
         }
-    }
+    })
+    .await?;
 
     client
-        .disconnect_from_db(DisconnectFromDbRequest {
-            session_id: session_id,
-        })
+        .disconnect_from_db(DisconnectFromDbRequest { session_id })
         .await?;
 
     Ok(())

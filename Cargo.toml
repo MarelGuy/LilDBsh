@@ -5,8 +5,8 @@ edition = "2021"
 build = "build.rs"
 
 [dependencies]
-reedline = "0.44.0"
-tonic = {version = "0.14.2", features=["tls-ring", "tls-native-roots"]}
+reedline = { version = "0.44.0", features = ["external_printer"] }
+tonic = {version = "0.14.2", features = ["tls-ring", "tls-native-roots"] }
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-stream = "0.1.18"
 prost = "0.14.3"
